@@ -7,7 +7,8 @@ the name of the author above.
 
 #include <stdio.h>
 #include <curand_kernel.h>
-
+#include <stdlib.h>
+#include <math.h>
 
 // Function that catches the error 
 void testCUDA(cudaError_t error, const char* file, int line) {
@@ -55,21 +56,41 @@ __global__ void init_curand_state_k(curandState* state)
 
 
 // Monte Carlo simulation kernel
-__global__ void MC_k1(float S_0, float r, float sigma, float dt, float K, int N, curandState *state, float *PayGPU){
+__global__ void Heston_Euler_MC_k(float S_0, float v_0, float r, float kappa, float theta, float sigma, float rho, float dt, int N,curandState* state, float* PayGPU){
 
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
   curandState localState = state[idx];
-  float2 G;
+
+
+  float G1;
+  float G2;
+  float Z;
+
 
   float S = S_0;
+  float	v = v_0;
+
 
   for (int i = 0; i < N; i++){
-    G = curand_normal2(&localState);
-    S *= (1 + r * dt * dt + sigma * dt * G.x);
+
+	  G1 = curand_normal(&localState);
+	  G2 = curand_normal(&localState);
+
+	  Z = rho * G1 + sqrtf(1.0f - rho * rho) * G2;
+
+
+	  S = S + r * S * dt + sqrtf(v) * S * sqrtf(dt) * (Z);
+
+
+	  v = v + kappa * (theta - v) * dt + sigma * sqrtf(v) * sqrtf(dt) * G1;
+
+	  v = fmaxf(v, 0.0f);
+  
+  
   }
 
-  PayGPU[idx] = expf(-r * dt * dt * N) * fmaxf(0.0f, S-K);
-  // state[idx] = localState;
+  PayGPU[idx] = fmaxf(S - 1.0f, 0.0f);
+  state[idx] = localState;
 }
 
 int main(void) {
@@ -77,13 +98,16 @@ int main(void) {
 	int NTPB = 512;
 	int NB = 512;
 	int n = NB * NTPB;
+	float S_0 = 1.0f;
+	float v_0 = 0.1f;
+	float r = 0.0f;
+	float kappa = 0.5f;
+	float theta = 0.1f;
+	float sigma = 0.3f;
+	float rho = 0.5f; // not given in project description, I choose it to be 0.5
 	float T = 1.0f;
-	float S_0 = 50.0f;
-	float K = S_0;
-	float sigma = 0.2f;
-	float r = 0.1f;
-	int N = 100;
-	float dt = sqrtf(T/N);
+	int N = 1000;
+	float dt = T / N;
 	float sum = 0.0f;
 	float sum2 = 0.0f;
   float* PayCPU, * PayGPU;
@@ -102,7 +126,7 @@ int main(void) {
 	cudaEventCreate(&stop);				// GPU timer instructions
 	cudaEventRecord(start, 0);			// GPU timer instructions
 
-	MC_k1<<<NB, NTPB>>>(S_0,r,sigma,dt,K,N,states,PayGPU);
+	Heston_Euler_MC_k <<<NB, NTPB>>>(S_0, v_0, r, kappa, theta, sigma, rho, dt, N, states, PayGPU);
 
 	cudaEventRecord(stop, 0);			// GPU timer instructions
 	cudaEventSynchronize(stop);			// GPU timer instructions
@@ -111,24 +135,24 @@ int main(void) {
 	cudaEventDestroy(start);			// GPU timer instructions
 	cudaEventDestroy(stop);				// GPU timer instructions
 
-  cudaMemcpy(PayCPU, PayGPU, n * sizeof(float), cudaMemcpyDeviceToHost);
+	testCUDA(cudaMemcpy(PayCPU, PayGPU, n * sizeof(float), cudaMemcpyDeviceToHost));
 
 	// Reduction performed on the host
 	for (int i = 0; i < n; i++) {
 		sum += PayCPU[i]/n;
 		sum2 += PayCPU[i]*PayCPU[i]/n;
 	};
-
-	printf("The estimated price is equal to %f\n", sum);
+	for (int i = 0; i < 5; i++) {
+		printf("PayCPU[%d] = %f\n", i, PayCPU[i]);
+	};
+	printf("The estimated price of E[(S1-1)+] is equal to %f\n", sum);
 	printf("error associated to a confidence interval of 95%% = %f\n",
 		1.96 * sqrt((double)(1.0f / (n - 1)) * (n*sum2 - (sum * sum)))/sqrt((double)n));
-	printf("The true price %f\n", S_0 * NP((r + 0.5 * sigma * sigma)/sigma) -
-									K * expf(-r) * NP((r - 0.5 * sigma * sigma) / sigma));
 	printf("Execution time %f ms\n", Tim);
 
-  free(PayCPU);
-  cudaFree(PayGPU);
-  cudaFree(states);
+	  free(PayCPU);
+	  cudaFree(PayGPU);
+	  cudaFree(states);
 
 	return 0;
 }
